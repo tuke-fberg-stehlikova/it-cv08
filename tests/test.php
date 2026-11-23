@@ -1,13 +1,12 @@
 <?php
-// Autograder cv07: 10 kontrol × 10 bodov. Spúšťa sa v GitHub Actions (.github/workflows/classroom.yml) alebo lokálne: php tests/test.php
+// Autograder cv08: 10 kontrol × 10 bodov. Spúšťa sa v GitHub Actions (.github/workflows/classroom.yml) alebo lokálne: php tests/test.php
 declare(strict_types=1);
 
 $root = dirname(__DIR__);
-$prefix = '/student/test.user/it/cv07';
+$prefix = '/student/test.user/it/cv08';
 $port = 8765;
 $score = 0;
 $results = [];
-$cookies = [];
 
 function check(string $name, bool $ok, string $hint = ''): void
 {
@@ -16,25 +15,11 @@ function check(string $name, bool $ok, string $hint = ''): void
     $results[] = sprintf('%s %s%s', $ok ? '✔' : '✘', $name, $ok || $hint === '' ? '' : "  → $hint");
 }
 
-/** HTTP požiadavka na php -S; vráti [stavový kód, telo, hlavičky]. Cookies si pamätá v $cookies (cookie jar ako prehliadač). */
-function req(string $method, string $path, array $data = [], bool $withCookies = true): array
+/** HTTP GET na php -S; vráti [stavový kód, telo, hlavičky (kľúče malými písmenami)]. */
+function get(string $path): array
 {
-    global $prefix, $port, $cookies;
-    $header = '';
-    if ($withCookies && $cookies !== []) {
-        $pairs = [];
-        foreach ($cookies as $k => $v) {
-            $pairs[] = "$k=$v";
-        }
-        $header .= 'Cookie: ' . implode('; ', $pairs) . "\r\n";
-    }
-    $opts = ['method' => $method, 'ignore_errors' => true, 'timeout' => 10, 'follow_location' => 0];
-    if ($method === 'POST') {
-        $header .= "Content-Type: application/x-www-form-urlencoded\r\n";
-        $opts['content'] = http_build_query($data);
-    }
-    $opts['header'] = $header;
-    $ctx = stream_context_create(['http' => $opts]);
+    global $prefix, $port;
+    $ctx  = stream_context_create(['http' => ['method' => 'GET', 'ignore_errors' => true, 'timeout' => 10, 'follow_location' => 0]]);
     $body = @file_get_contents("http://127.0.0.1:$port$prefix$path", false, $ctx);
     $status = 0;
     $headers = [];
@@ -43,127 +28,153 @@ function req(string $method, string $path, array $data = [], bool $withCookies =
             $status = (int) $m[1];
         } elseif (str_contains($h, ':')) {
             [$k, $v] = explode(':', $h, 2);
-            $k = strtolower(trim($k));
-            $v = trim($v);
-            if ($k === 'set-cookie') {
-                $headers['set-cookie'][] = $v;
-                if (preg_match('/^([^=]+)=([^;]*)/', $v, $c)) {
-                    $cookies[$c[1]] = $c[2];
-                }
-            } else {
-                $headers[$k] = $v;
-            }
+            $headers[strtolower(trim($k))] = trim($v);
         }
     }
     return [$status, (string) $body, $headers];
 }
 
-function get(string $path, bool $withCookies = true): array
+function isJson(array $headers): bool
 {
-    return req('GET', $path, [], $withCookies);
-}
-
-/** Vytiahne CSRF token zo skrytého inputu na stránke $path (zavolá GET, aby token vznikol a cookie sa uložila). */
-function csrf(string $path): string
-{
-    [, $html] = get($path);
-    return preg_match('/name=["\']csrf["\']\s+value=["\']([^"\']+)["\']/', $html, $m) ? $m[1] : '';
-}
-
-function hasForm(string $html): bool
-{
-    return (bool) preg_match('/<form\b[^>]*method=["\']post["\']/i', $html);
+    return str_contains(strtolower($headers['content-type'] ?? ''), 'application/json');
 }
 
 // --- statické kontroly súborov -------------------------------------------------
+$migrations = glob("$root/sql/migrations/*.sql") ?: [];
+$migAll = '';
+foreach ($migrations as $f) {
+    $migAll .= (string) file_get_contents($f);
+}
+check('sql/migrations/: aspoň dva súbory .sql, jeden s CREATE INDEX',
+    count($migrations) >= 2 && preg_match('/CREATE\s+INDEX/i', $migAll) === 1,
+    'priečinok sql/migrations/ so súbormi 001_….sql (ALTER TABLE z týždňa 8) a 002_….sql (CREATE INDEX) (úloha 9.2)');
+
 $schema = @file_get_contents("$root/sql/schema.sql") ?: '';
-check('sql/schema.sql: users.role a user_id v hlavnej entite s FOREIGN KEY na users',
-    preg_match('/\brole\b/', $schema) && preg_match('/\buser_id\b/', $schema)
-        && preg_match('/FOREIGN\s+KEY\s*\(\s*`?user_id`?\s*\)\s*REFERENCES\s+`?users`?/i', $schema),
-    'stĺpec users.role, stĺpec user_id v tabuľke hlavnej entity a FOREIGN KEY (user_id) REFERENCES users(id) (úlohy 8.1, 8.2)');
+check('sql/schema.sql: INDEX na stĺpec (okrem PRIMARY a FOREIGN KEY)',
+    preg_match('/(?<!PRIMARY )(?<!UNIQUE )\bINDEX\s+`?\w+`?\s*\(/i', $schema) === 1 || preg_match('/CREATE\s+INDEX/i', $schema) === 1,
+    'riadok INDEX idx_… (stĺpec) v CREATE TABLE main entity, rovnaký ako v migrácii 002 (úloha 9.2)');
 
-$base = @file_get_contents("$root/src/Controller/BaseController.php") ?: '';
-check('src/Controller/BaseController.php: requireLogin() a authorize()',
-    preg_match('/function\s+requireLogin\s*\(/', $base) && preg_match('/function\s+authorize\s*\(/', $base),
-    'metódy requireLogin(): ?Response a authorize(array $record): ?Response v BaseController (úloha 8.3)');
-
-// Controller hlavnej entity = súbor, ktorý má metódu edit()
-$mainCtrl = '';
-foreach (glob("$root/src/Controller/*.php") as $f) {
+// Model main entity = súbor v src/Model/ s beginTransaction
+$mainModel = '';
+foreach (glob("$root/src/Model/*.php") as $f) {
     $c = (string) file_get_contents($f);
-    if (preg_match('/function\s+edit\s*\(/', $c)) {
-        $mainCtrl = $c;
+    if (str_contains($c, 'beginTransaction')) {
+        $mainModel = $c;
         break;
     }
 }
-check('Controller hlavnej entity: edit(), update() a delete()',
-    $mainCtrl !== '' && preg_match('/function\s+update\s*\(/', $mainCtrl) && preg_match('/function\s+delete\s*\(/', $mainCtrl),
-    'metódy edit(), update() a delete() v controlleri hlavnej entity (úloha 8.4)');
+check('Model main entity: beginTransaction(), commit() a rollBack()',
+    $mainModel !== '' && str_contains($mainModel, 'commit(') && str_contains($mainModel, 'rollBack('),
+    'insert() a update() v modeli obalené beginTransaction() / try / commit() / catch / rollBack() (úloha 9.6)');
 
-$ix = @file_get_contents("$root/index.php") ?: '';
-$posParams = strpos($ix, 'session_set_cookie_params');
-$posReq    = strpos($ix, 'Request::fromGlobals');
-check('index.php: session_set_cookie_params s path za Request::fromGlobals(), route edit/update/delete',
-    $posParams !== false && preg_match('/[\'"]path[\'"]\s*=>/', $ix)
-        && $posReq !== false && $posParams > $posReq
-        && preg_match('#\{id\}/edit#', $ix) && preg_match('#\{id\}/delete#', $ix),
-    'session_set_cookie_params([...path...]) a session_start() AŽ ZA Request::fromGlobals(); route .../{id}/edit a .../{id}/delete (úlohy 8.1, 8.4, cookie session)');
+$form = @file_get_contents("$root/views/form.twig") ?: '';
+check('views/form.twig: checkbox s name="…[]"',
+    preg_match('/type=["\']checkbox["\'][^>]*name=["\']\w+\[\]["\']|name=["\']\w+\[\]["\'][^>]*type=["\']checkbox["\']/i', $form) === 1,
+    '<input type="checkbox" name="<lookup>[]" value="{{ c.id }}"> pre každý záznam lookup table (úloha 9.5)');
 
-$csrfFile = @file_get_contents("$root/src/Csrf.php") ?: '';
-check('src/Csrf.php: token() a check()',
-    preg_match('/function\s+token\s*\(/', $csrfFile) && preg_match('/function\s+check\s*\(/', $csrfFile),
-    'trieda Csrf so static metódami token() a check() (zo súborov bezpecnost.zip)');
+$response = @file_get_contents("$root/src/Http/Response.php") ?: '';
+$request  = @file_get_contents("$root/src/Http/Request.php") ?: '';
+check('src/Http/Response.php: json(); src/Http/Request.php: postArray()',
+    preg_match('/function\s+json\s*\(/', $response) === 1 && preg_match('/function\s+postArray\s*\(/', $request) === 1,
+    'static metóda Response::json(array $data, int $status = 200) a metóda Request::postArray(string $key) (úlohy 9.5, 9.7)');
 
-$router  = @file_get_contents("$root/src/Router.php") ?: '';
-$helpers = @file_get_contents("$root/src/helpers.php") ?: '';
-check('src/Router.php kontroluje CSRF token pri POST; src/helpers.php má csrf_field()',
-    str_contains($router, 'Csrf') && str_contains($helpers, 'csrf_field'),
-    'Router pri POST volá Csrf::check(); helpers.php registruje Twig funkciu csrf_field() (zo súborov bezpecnost.zip)');
-
-$auth = @file_get_contents("$root/src/Auth.php") ?: '';
-$ac   = @file_get_contents("$root/src/Controller/AuthController.php") ?: '';
-check('src/Auth.php: session_regenerate_id(); AuthController: pravidlo pre heslo (8 znakov)',
-    str_contains($auth, 'session_regenerate_id') && preg_match('/mb_strlen|strlen/', $ac) && str_contains($ac, 'password2'),
-    'session_regenerate_id(true) v Auth::login(); v register() kontrola dĺžky hesla a pole password2 (úlohy 8.1, 8.4)');
+$api = @file_get_contents("$root/src/Controller/ApiController.php") ?: '';
+$ix  = @file_get_contents("$root/index.php") ?: '';
+preg_match_all('#->get\(\s*[\'"](/api/[^\'"]+)[\'"]#', $ix, $mm);
+$apiRoutes = $mm[1];
+check('src/Controller/ApiController.php s Response::json(); index.php: aspoň 3 route /api/…',
+    $api !== '' && str_contains($api, 'Response::json') && count($apiRoutes) >= 3,
+    'ApiController s metódami, ktoré vracajú Response::json(); route GET /api/<entita>, /api/<entita>/{id}, /api/<lookup> (úloha 9.7)');
 
 // --- HTTP kontroly cez php -S ----------------------------------------------------
 $cmd = sprintf('php -S 127.0.0.1:%d %s > /dev/null 2>&1 & echo $!', $port, escapeshellarg("$root/tests/router.php"));
 $pid = (int) trim((string) shell_exec($cmd));
 usleep(800000);
 
-// discover main entity base path from the edit route '/X/{id}/edit'
-$entity = preg_match('#[\'"](/[a-z0-9_\-]+)/\{id\}/edit[\'"]#i', $ix, $m) ? $m[1] : '/recipes';
-$newPath = preg_match('#->get\(\s*[\'"](/[a-z0-9_\-]+/new)[\'"]#i', $ix, $mm) ? $mm[1] : $entity . '/new';
-
-[$s, $b, $h] = get('/', false);
-$setCookie = implode(' ', $h['set-cookie'] ?? []);
-check('GET / → 200, Set-Cookie PHPSESSID s path (nie iba /) a SameSite',
-    $s === 200 && preg_match('/PHPSESSID=/', $setCookie)
-        && preg_match('#path=/[^;\s]+#', $setCookie) && !preg_match('#path=/;#', $setCookie . ';')
-        && stripos($setCookie, 'samesite') !== false,
-    "stavový kód $s; session_set_cookie_params nastavuje path na prefix a samesite; cookie: " . ($setCookie ?: '(žiadna)'));
-
-[$s] = req('POST', '/login', ['username' => 'x', 'password' => 'y']);   // bez CSRF tokenu
-check('POST /login bez CSRF tokenu → 403',
-    $s === 403,
-    "stavový kód $s; Router má pri každom POST bez platného tokenu vrátiť 403 (bezpecnost.zip: Router + Csrf)");
-
-// plný tok: register (slabé heslo → formulár), register OK, login, GET entita/new → 200
-$user = 'ag' . random_int(10000, 99999);
-$t1 = csrf('/register');
-[$sWeak, $bWeak] = req('POST', '/register', ['username' => $user, 'password' => 'abc', 'password2' => 'abc', 'csrf' => $t1]);
-$t2 = csrf('/register');
-[$sReg, , $hReg] = req('POST', '/register', ['username' => $user, 'password' => 'Heslo1234', 'password2' => 'Heslo1234', 'csrf' => $t2]);
-$okReg = $sWeak === 200 && hasForm($bWeak) && $sReg === 302;
-$why = "slabé heslo → $sWeak (má byť 200 s formulárom), platná registrácia → $sReg (má byť 302)";
-if ($okReg) {
-    $t3 = csrf('/login');
-    [$sLog, , $hLog] = req('POST', '/login', ['username' => $user, 'password' => 'Heslo1234', 'csrf' => $t3]);
-    [$sNew, $bNew] = get($newPath);
-    $okReg = $sLog === 302 && $sNew === 200 && hasForm($bNew);
-    $why = "login → $sLog (302), GET $newPath po prihlásení → $sNew (200 s formulárom)";
+// Kandidáti: main entity = route '/api/X/{id}'; lookup = route '/api/Y' bez {id}, rôzna od main entity.
+// Pri viacerých kandidátoch (vlastný endpoint z 9.8, /api/<lookup>/{id} z obhajoby) sa vyberie ten, ktorý sa správa správne.
+$entityCandidates = [];
+$plainCandidates  = [];
+foreach ($apiRoutes as $r) {
+    if (preg_match('#^(/api/[a-z0-9_\-]+)/\{[a-z_]+\}$#i', $r, $m)) {
+        $entityCandidates[] = $m[1];
+    } elseif (preg_match('#^/api/[a-z0-9_\-]+$#i', $r)) {
+        $plainCandidates[] = $r;
+    }
 }
-check('Registrácia (slabé heslo → formulár; platné → 302), prihlásenie s CSRF tokenom, formulár len pre prihláseného', $okReg, $okReg ? '' : $why);
+if ($entityCandidates === []) {
+    $entityCandidates = ['/api/recipes'];
+}
+
+// main entity: prvý kandidát, ktorého /api/X vráti JSON pole a /api/X/<id> objekt s poľom (pivot hodnoty); inak prvý kandidát
+$entity = $entityCandidates[0];
+$list   = null;
+$one    = null;
+$sList  = 0;
+$hList  = [];
+$sOne   = 0;
+$hOne   = [];
+$firstId = 1;
+foreach ($entityCandidates as $cand) {
+    [$s1, $b1, $h1] = get($cand);
+    $l = json_decode($b1, true);
+    $okL = $s1 === 200 && isJson($h1) && is_array($l) && array_is_list($l) && $l !== [] && isset($l[0]['id']);
+    $id = $okL ? (int) $l[0]['id'] : 1;
+    [$s2, $b2, $h2] = get("$cand/$id");
+    $o = json_decode($b2, true);
+    $hasArr = false;
+    foreach (is_array($o) ? $o : [] as $v) {
+        if (is_array($v)) {
+            $hasArr = true;
+        }
+    }
+    $okO = $s2 === 200 && isJson($h2) && is_array($o) && isset($o['id']) && (int) $o['id'] === $id && $hasArr;
+    if ($list === null || ($okL && $okO)) {          // prvý kandidát ako záloha; kandidát, ktorý prešiel, ho nahradí
+        $entity = $cand;
+        [$list, $sList, $hList, $firstId] = [$l, $s1, $h1, $id];
+        [$one, $sOne, $hOne, $oneHasArr] = [$o, $s2, $h2, $hasArr];
+    }
+    if ($okL && $okO) {
+        break;
+    }
+}
+$okList = $sList === 200 && isJson($hList) && is_array($list) && array_is_list($list) && $list !== [] && isset($list[0]['id']);
+check("GET $entity → 200, Content-Type application/json, pole záznamov",
+    $okList,
+    "stavový kód $sList, Content-Type: " . ($hList['content-type'] ?? '(žiadny)') . '; telo má byť JSON pole objektov s kľúčom id (seed.sql má mať záznamy)');
+
+check("GET $entity/$firstId → 200 JSON objekt s id a s hodnotami z pivot table (pole)",
+    $sOne === 200 && isJson($hOne) && is_array($one) && isset($one['id']) && (int) $one['id'] === $firstId && ($oneHasArr ?? false),
+    "stavový kód $sOne; show() má vrátiť jeden record ako objekt a v ňom kľúč s poľom hodnôt z pivot table (napr. \"categories\": [...]) (úloha 9.7)");
+
+[$s, $b, $h] = get("$entity/999999");
+$err = json_decode($b, true);
+check("GET $entity/999999 → 404 a JSON s kľúčom error",
+    $s === 404 && isJson($h) && is_array($err) && isset($err['error']),
+    "stavový kód $s; pri neznámom id Response::json(['error' => 'Not found'], 404) (úloha 9.7)");
+
+// lookup: ktorýkoľvek kandidát (rôzny od main entity), ktorý vráti JSON pole záznamov
+$lookupOk   = false;
+$lookupName = '';
+$lookupWhy  = [];
+foreach ($plainCandidates as $cand) {
+    if ($cand === $entity) {
+        continue;
+    }
+    [$s, $b, $h] = get($cand);
+    $lk = json_decode($b, true);
+    if ($s === 200 && isJson($h) && is_array($lk) && array_is_list($lk) && $lk !== []) {
+        $lookupOk   = true;
+        $lookupName = $cand;
+        break;
+    }
+    $lookupWhy[] = "$cand → $s" . (isJson($h) ? '' : ' (nie JSON)');
+}
+check('GET /api/<lookup> → 200 JSON pole záznamov lookup table' . ($lookupName !== '' ? " ($lookupName)" : ''),
+    $lookupOk,
+    $plainCandidates === [] || array_diff($plainCandidates, [$entity]) === []
+        ? 'v index.php chýba route GET /api/<lookup> (bez {id}) (úloha 9.7)'
+        : 'žiadna route bez {id} okrem main entity nevrátila JSON pole: ' . implode(', ', $lookupWhy) . ' (metóda pre lookup table má vrátiť Response::json(getAll()))');
 
 if ($pid) {
     exec("kill $pid 2>/dev/null");
